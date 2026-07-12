@@ -47,12 +47,6 @@ ORDER BY count() DESC;
   50k righe o 2s, il primo che si verifica.
 
 ## Cosa manca per portarlo in produzione
-
-- Creazione automatica del topic Redpanda con N partizioni (oggi si affida
-  all'auto-create di default).
 - TLS/mTLS tra i servizi.
 - Metriche Prometheus su ingestor/worker (queue depth, batch latency, errori).
 - Retry/backoff con dead-letter topic per i messaggi malformati nel worker.
-- Dato che il progetto non ha accesso a Internet in questo ambiente, `go.sum`
-  non è stato generato: al primo build servirà `go mod tidy` con accesso alla
-  rete per scaricare `clickhouse-go/v2` e `kafka-go`.
