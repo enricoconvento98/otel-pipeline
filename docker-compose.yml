@@ -1,0 +1,135 @@
+
+networks:
+  otel-net:
+    driver: bridge
+
+volumes:
+  ch-data:
+  rp-data:
+
+services:
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: clickhouse
+    environment:
+      - 'CLICKHOUSE_USER=otel'
+      - 'CLICKHOUSE_PASSWORD=otel-pw'
+      - 'CLICKHOUSE_DB=otel'
+    ports:
+      - "8123:8123"   # HTTP
+      - "9000:9000"   # Native protocol
+    volumes:
+      - ch-data:/var/lib/clickhouse
+      - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    networks:
+      - otel-net
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.1.10
+    container_name: redpanda
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092
+    ports:
+      - "9092:9092"
+      - "9644:9644"  # admin/health
+    volumes:
+      - rp-data:/var/lib/redpanda/data
+    networks:
+      - otel-net
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  ingestor:
+    build:
+      context: ./ingestor
+    container_name: ingestor
+    environment:
+      - KAFKA_BROKERS=redpanda:9092
+      - KAFKA_TOPIC=otel-logs
+      - HTTP_PORT=8080
+      - WORKER_POOL_SIZE=64
+      - CHANNEL_BUFFER=100000
+    ports:
+      - "8080:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redpanda-init:
+          condition: service_completed_successfully
+    networks:
+      - otel-net
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./worker
+    # container_name: worker
+    environment:
+      - KAFKA_BROKERS=redpanda:9092
+      - KAFKA_TOPIC=otel-logs
+      - KAFKA_GROUP=ch-writers
+      - CLICKHOUSE_ADDR=clickhouse:9000
+      - CLICKHOUSE_DB=otel
+      - BATCH_SIZE=50000
+      - FLUSH_INTERVAL_MS=2000
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
+    networks:
+      - otel-net
+    restart: unless-stopped
+    deploy:
+      replicas: 2   # scala orizzontalmente i writer, uno per partizione consumer-group
+
+  generator:
+    build:
+      context: ./generator
+    container_name: generator
+    environment:
+      - TARGET_URL=http://ingestor:8080/ingest
+      - CONCURRENCY=200
+      - RATE_PER_WORKER=5000   # log/sec per goroutine, regola per il carico desiderato
+    depends_on:
+      - ingestor
+    networks:
+      - otel-net
+    restart: unless-stopped
+
+  redpanda-init:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.1.10
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ['/bin/sh', '-c']
+    command: 
+      - |
+        rpk topic create otel-logs --partitions 2 --replicas 1 --brokers redpanda:9092 ||
+        rpk topic describe otel-logs --brokers redpanda:9092
+    networks:
+      - otel-net
